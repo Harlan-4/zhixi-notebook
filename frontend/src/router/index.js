@@ -9,6 +9,7 @@ const routes = [
   { path: '/graph', name: 'graph', component: () => import('../views/GraphView.vue'), meta: { title: '知识图谱' } },
   { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '设置' } },
   { path: '/print/questions', name: 'printQuestions', component: () => import('../views/PrintQuestionsView.vue'), meta: { plain: true, title: '打印错题重做清单' } },
+  { path: '/print/retest', name: 'printRetest', component: () => import('../views/PrintRetestView.vue'), meta: { plain: true, title: '错题重测卷' } },
   { path: '/print/plan/:id', name: 'printPlan', component: () => import('../views/PrintPlanView.vue'), meta: { plain: true, title: '打印学习计划' } },
 ]
 

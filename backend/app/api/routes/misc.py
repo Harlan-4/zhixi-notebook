@@ -5,10 +5,17 @@ from sqlalchemy.orm import Session
 from ...database import get_db
 from ...models import AppSetting, Paper, Question, StudyPlan
 from ...services import ai_client
+from ...services.gamification import get_gamification
 from ...services.knowledge import compute_mastery
 from ...seed import reset_demo
 
 router = APIRouter(prefix="/api", tags=["misc"])
+
+
+@router.get("/stats/gamification")
+def stats_gamification(db: Session = Depends(get_db)):
+    """游戏化徽标：连续打卡天数 + 已收服题数。"""
+    return get_gamification(db)
 
 
 @router.get("/stats/overview")

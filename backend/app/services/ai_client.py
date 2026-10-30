@@ -68,7 +68,7 @@ def extract_json(text: str):
     return None
 
 
-def chat_json(messages: list, model: str | None = None, temperature: float = 0.3) -> dict:
+def chat_json(messages: list, model: str | None = None, temperature: float = 0.3, timeout: float | None = None) -> dict:
     cfg = get_config()
     if not cfg["api_key"]:
         raise AINotConfigured(
@@ -80,7 +80,10 @@ def chat_json(messages: list, model: str | None = None, temperature: float = 0.3
     last_text = ""
     for _ in range(2):  # 首次输出非 JSON 时给一次纠正机会
         try:
-            resp = client.chat.completions.create(model=use_model, messages=msgs, temperature=temperature)
+            resp = client.chat.completions.create(
+                model=use_model, messages=msgs, temperature=temperature,
+                timeout=timeout or cfg["timeout"],
+            )
         except Exception as e:  # noqa: BLE001 — 网络/鉴权等上游错误统一转成可读信息
             raise AIServiceError(f"AI 调用失败：{type(e).__name__}: {e}") from e
         last_text = resp.choices[0].message.content or ""
@@ -92,6 +95,23 @@ def chat_json(messages: list, model: str | None = None, temperature: float = 0.3
             {"role": "user", "content": "以上输出不是合法的JSON。请重新输出：只输出一个JSON对象，不要任何解释文字，不要markdown代码块。"},
         ]
     raise AIServiceError("AI 未返回有效的 JSON，请重试或更换模型")
+
+
+def chat_text(messages: list, model: str | None = None, temperature: float = 0.4) -> str:
+    """普通文本对话（不要求 JSON 输出），用于讲解答疑类多轮对话。"""
+    cfg = get_config()
+    if not cfg["api_key"]:
+        raise AINotConfigured(
+            "尚未配置 AI 服务：请在网页「设置」页填写 API Key（OpenAI 兼容接口），或编辑 backend/.env"
+        )
+    client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"], timeout=cfg["timeout"])
+    try:
+        resp = client.chat.completions.create(
+            model=model or cfg["text_model"], messages=list(messages), temperature=temperature
+        )
+    except Exception as e:  # noqa: BLE001 — 网络/鉴权等上游错误统一转成可读信息
+        raise AIServiceError(f"AI 调用失败：{type(e).__name__}: {e}") from e
+    return (resp.choices[0].message.content or "").strip()
 
 
 def vision_json(prompt: str, image_bytes: bytes, mime: str = "image/jpeg") -> dict:
@@ -106,6 +126,29 @@ def vision_json(prompt: str, image_bytes: bytes, mime: str = "image/jpeg") -> di
         }
     ]
     return chat_json(messages, model=cfg["vision_model"])
+
+
+def vision_json_multi(prompt: str, images: list) -> dict:
+    """多图视觉识别：images = [{"data": bytes, "mime": str, "label": str}, ...]。
+
+    每张图前可带说明文字（label），如【试卷 第1张】/【答题卡 第2张】，供模型区分图片用途。
+    """
+    cfg = get_config()
+    if not cfg["api_key"]:
+        raise AINotConfigured(
+            "尚未配置 AI 服务：请在网页「设置」页填写 API Key（OpenAI 兼容接口），或编辑 backend/.env"
+        )
+    content = [{"type": "text", "text": prompt}]
+    for img in images:
+        if img.get("label"):
+            content.append({"type": "text", "text": img["label"]})
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": image_data_url(img["data"], img.get("mime", "image/jpeg"))},
+        })
+    messages = [{"role": "user", "content": content}]
+    # 多图（整卷+答题卡）信息量大、推理慢，独立放宽到 5 分钟，避免被默认 180s 超时砍掉
+    return chat_json(messages, model=cfg["vision_model"], timeout=300.0)
 
 
 def test_connection() -> tuple[bool, str]:

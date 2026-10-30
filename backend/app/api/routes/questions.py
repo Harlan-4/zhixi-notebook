@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from ...database import get_db
 from ...models import Question
 from ...serializers import question_to_dict
-from ...services import ai_client, question_service
+from ...services import ai_client, gamification, question_service
 
 router = APIRouter(prefix="/api/questions", tags=["questions"])
 
@@ -24,6 +24,7 @@ def list_questions(
     status: str = "",
     kp: str = "",
     subject: str = "",
+    grade: str = "",
     q: str = "",
     db: Session = Depends(get_db),
 ):
@@ -32,6 +33,8 @@ def list_questions(
         query = query.filter(Question.status == status)
     if subject:
         query = query.filter(Question.subject == subject)
+    if grade:
+        query = query.filter(Question.grade == grade)
     items = [question_to_dict(x) for x in query.all()]
     if kp:
         items = [x for x in items if x["analysis"] and kp in (x["analysis"].get("knowledge_points") or [])]
@@ -185,14 +188,52 @@ def check_answer(question_id: int, payload: dict, db: Session = Depends(get_db))
     return result
 
 
-@router.post("/{question_id}/review")
-def review_question(question_id: int, payload: dict, db: Session = Depends(get_db)):
-    """复习打卡：result = pass / fail，按艾宾浩斯间隔推进。"""
+@router.post("/{question_id}/qa-chat")
+def qa_chat(question_id: int, payload: dict, db: Session = Depends(get_db)):
+    """讲解答疑对话：学生就本题解析中没看懂的地方向 AI 提问。"""
     question = _get_question(db, question_id)
     try:
-        question_service.review_question(question, payload.get("result", ""))
+        result = question_service.qa_chat_question(db, question, (payload or {}).get("message", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except ai_client.AINotConfigured as e:
+        raise HTTPException(503, str(e))
+    except ai_client.AIServiceError as e:
+        raise HTTPException(502, str(e))
+    return result
+
+
+@router.post("/{question_id}/diagnose-chat")
+def diagnose_chat(question_id: int, payload: dict, db: Session = Depends(get_db)):
+    """错因追问对话：学生回答诊断追问，AI 收集证据，证据足够时确认错因并回写。"""
+    question = _get_question(db, question_id)
+    try:
+        result = question_service.diagnose_chat_question(db, question, (payload or {}).get("message", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except ai_client.AINotConfigured as e:
+        raise HTTPException(503, str(e))
+    except ai_client.AIServiceError as e:
+        raise HTTPException(502, str(e))
+    return result
+
+
+@router.post("/{question_id}/review")
+def review_question(question_id: int, payload: dict, db: Session = Depends(get_db)):
+    """复习打卡：result = pass / fail，按艾宾浩斯间隔推进；pass 返回鼓励语，fail 返回共情语。"""
+    question = _get_question(db, question_id)
+    try:
+        just_collected = question_service.review_question(question, payload.get("result", ""))
     except ValueError as e:
         raise HTTPException(400, str(e))
     db.commit()
     db.refresh(question)
-    return question_to_dict(question)
+    streak = gamification.record_review(db)
+    db.commit()
+    passed = payload.get("result") == "pass"
+    return {
+        "question": question_to_dict(question),
+        "praise": gamification.praise_for(question) if passed else "",
+        "streak": streak,
+        "just_collected": just_collected,
+    }

@@ -20,6 +20,7 @@ def question_to_dict(q) -> dict:
         "review_stage": q.review_stage,
         "last_result": q.last_result,
         "next_review_at": q.next_review_at.isoformat() if q.next_review_at else None,
+        "collected_at": q.collected_at.isoformat() if q.collected_at else None,
         "created_at": q.created_at.isoformat() if q.created_at else None,
     }
 

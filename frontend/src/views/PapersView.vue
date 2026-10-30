@@ -94,8 +94,31 @@
         description="请先到「设置」页配置 API Key；或直接用「手动录入试卷」。"
         class="mb12"
       />
-      <input type="file" accept="image/*" @change="onPickPhoto" :disabled="photoUploading" />
-      <div v-if="photoUploading" class="mt8">正在上传识别，请稍候（整卷识别较慢）…</div>
+      <div class="upload-grid">
+        <div class="upload-cell">
+          <div class="upload-label">📄 试卷照片（必填，可多张，按页序）</div>
+          <input type="file" accept="image/*" multiple @change="(e) => onPickFiles(e, 'paper')" :disabled="photoUploading" />
+          <div class="muted" v-if="paperFiles.length">已选 {{ paperFiles.length }} 张</div>
+        </div>
+        <div class="upload-cell">
+          <div class="upload-label">📝 答题卡照片（选填，可多张）</div>
+          <input type="file" accept="image/*" multiple @change="(e) => onPickFiles(e, 'answer')" :disabled="photoUploading" />
+          <div class="muted" v-if="answerFiles.length">已选 {{ answerFiles.length }} 张</div>
+        </div>
+      </div>
+      <div class="muted mt8">
+        同时上传试卷和答题卡时，AI 会对照批改痕迹自动判定每题得分与错误点；只传试卷则识别题目和分值，得分需手动补填。
+      </div>
+      <div class="mt8" v-if="!draftReady">
+        <el-button type="primary" :loading="photoUploading" :disabled="!paperFiles.length" @click="recognizeFiles">
+          🔍 开始 AI 识别
+        </el-button>
+        <span v-if="photoUploading" class="muted ml8">
+          <template v-if="photoStage === 'compressing'">正在压缩图片…</template>
+          <template v-else-if="photoStage === 'uploading'">正在上传…</template>
+          <template v-else>🤖 AI 识别中，已用 {{ photoElapsed }} 秒（整卷加答题卡可能需要 1–3 分钟，请勿关闭）…</template>
+        </span>
+      </div>
       <template v-if="draftReady">
         <el-form label-width="80px" class="mt16">
           <div class="form-grid">
@@ -128,7 +151,8 @@
             </template>
           </el-table-column>
         </el-table>
-        <div class="muted mt8">请核对识别结果，补上每题得分后再保存。</div>
+        <el-alert v-if="gradeNote" :title="gradeNote" type="info" :closable="false" class="mt8" />
+        <div class="muted mt8">请核对识别结果，得分与实际情况不符的直接改，然后保存。</div>
       </template>
       <template #footer>
         <el-button @click="photoDlg = false">取消</el-button>
@@ -142,12 +166,32 @@
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '../api'
+import { compressImage } from '../utils/image'
 
 const router = useRouter()
 const papers = ref([])
 const kps = ref([])
 const loading = ref(true)
 const manualDlg = ref(false)
+const paperFiles = ref([])
+const answerFiles = ref([])
+const gradeNote = ref('')
+const photoStage = ref('')
+const photoElapsed = ref(0)
+let photoTimer = null
+
+function startPhotoTimer() {
+  photoElapsed.value = 0
+  photoTimer = setInterval(() => {
+    photoElapsed.value += 1
+  }, 1000)
+}
+function stopPhotoTimer() {
+  if (photoTimer) {
+    clearInterval(photoTimer)
+    photoTimer = null
+  }
+}
 const photoDlg = ref(false)
 const photoUploading = ref(false)
 const aiUnavailable = ref(false)
@@ -186,28 +230,51 @@ async function savePaper(fromPhoto) {
   router.push(`/paper/${p.id}?analyze=1`)
 }
 
-async function onPickPhoto(e) {
-  const file = e.target.files[0]
-  if (!file) return
+// 选择某类图片（paper/answer）：压缩后整组替换，支持重复选择更正
+async function onPickFiles(e, kind) {
+  const raw = [...e.target.files]
+  e.target.value = ''
+  if (!raw.length) return
+  const compressed = await Promise.all(raw.map((f) => compressImage(f)))
+  if (kind === 'answer') answerFiles.value = compressed
+  else paperFiles.value = compressed
+}
+
+async function recognizeFiles() {
+  if (!paperFiles.value.length || photoUploading.value) return
   photoUploading.value = true
   aiUnavailable.value = false
+  draftReady.value = false
   try {
+    photoStage.value = 'compressing'
     const rec = new FormData()
-    rec.append('file', file)
-    rec.append('mime', file.type || 'image/jpeg')
+    const entries = [
+      ...paperFiles.value.map((f) => ({ file: f, kind: 'paper' })),
+      ...answerFiles.value.map((f) => ({ file: f, kind: 'answer' })),
+    ]
+    const kinds = []
+    for (const { file, kind } of entries) {
+      rec.append('files', file)
+      kinds.push(kind)
+    }
+    rec.append('kinds', kinds.join(','))
+    photoStage.value = 'uploading'
+    startPhotoTimer()
     const { draft } = await api.post('/papers/recognize', rec)
     form.title = draft.title || '（请填写试卷名称）'
     form.questions = (draft.questions || []).map((q, i) => ({
       no: String(q.no ?? i + 1),
       text: q.text || '',
       score: q.score || 0,
-      got_score: 0,
+      got_score: q.got_score ?? 0,
       knowledge_points: q.knowledge_points || [],
     }))
+    gradeNote.value = draft.grade_note || ''
     draftReady.value = true
   } catch (err) {
     if (err.response?.status === 503) aiUnavailable.value = true
   } finally {
+    stopPhotoTimer()
     photoUploading.value = false
   }
 }
@@ -221,6 +288,9 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.upload-grid { display: flex; gap: 24px; flex-wrap: wrap; }
+.upload-cell { flex: 1; min-width: 240px; }
+.upload-label { font-weight: 600; margin-bottom: 6px; }
 .mb12 { margin-bottom: 12px; }
 .mb8 { margin-bottom: 8px; }
 .mt8 { margin-top: 8px; }

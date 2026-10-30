@@ -47,7 +47,10 @@ def _topological_with_levels(pmap: dict, sub: set[str]) -> tuple[list[str], dict
     indegree = {k: 0 for k in sub}
     children: dict[str, list[str]] = defaultdict(list)
     for name in sub:
-        for pre in pmap.get(name).prereqs or []:
+        node = pmap.get(name)
+        if not node:
+            continue  # 不在图谱中的名字（防御：理论上已被上游过滤）
+        for pre in node.prereqs or []:
             if pre in sub:
                 indegree[name] += 1
                 children[pre].append(name)
@@ -107,11 +110,12 @@ def generate_plan(db: Session, days: int = 7, title: str = "") -> StudyPlan:
         db.refresh(plan)
         return plan
 
-    # 1. 薄弱点 = 有证据且掌握度低
+    # 1. 薄弱点 = 有证据且掌握度低（只保留图谱内的标准名；
+    #    AI 解析可能自由输出图谱外的知识点名，它们无法按前置依赖排程，跳过）
     weak = {
         kp
         for kp in evidence
-        if mastery.get(kp, WEAK_THRESHOLD - 0.01) < WEAK_THRESHOLD
+        if kp in pmap and mastery.get(kp, WEAK_THRESHOLD - 0.01) < WEAK_THRESHOLD
     }
     # 2. 前置闭包：薄弱点的"薄弱祖先"也纳入（无证据的祖先不视为薄弱，只参与排序）
     anc = ancestors_closure(pmap, weak)

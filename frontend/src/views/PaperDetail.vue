@@ -26,6 +26,7 @@
       <div class="btn-row">
         <el-button type="primary" :loading="analyzing" @click="analyze">📊 生成/更新进步分析</el-button>
         <el-button @click="editScores = !editScores">✏️ {{ editScores ? '完成编辑' : '编辑逐题得分' }}</el-button>
+        <el-button @click="openImportDlg">📥 失分题加入错题本</el-button>
         <div class="spacer" />
         <el-button type="success" @click="makePlan">📅 按薄弱点生成学习计划</el-button>
       </div>
@@ -93,12 +94,31 @@
       </el-table>
       <el-button v-if="editScores" type="primary" class="mt8" @click="saveScores">保存得分</el-button>
     </el-card>
+
+    <el-dialog v-model="importDlg" title="把失分题加入错题本" width="640px">
+      <div class="muted mb8">勾选要收进错题本的题目（默认全选本卷失分题）。加入后到错题本逐题「AI 解析」，即可进入复习计划。</div>
+      <el-empty v-if="!wrongQuestions.length" description="本卷没有失分题，全部掌握！" :image-size="60" />
+      <div v-for="q in wrongQuestions" :key="q.no" class="wrong-item" @click="toggle(q.no)">
+        <el-checkbox :model-value="importNos.includes(q.no)" @change="toggle(q.no)">
+          <b>第{{ q.no }}题</b>
+          <span class="muted">（{{ q.got_score }}/{{ q.score }} 分）</span>
+        </el-checkbox>
+        <span class="wrong-text">{{ plainText(q.text) }}</span>
+      </div>
+      <template #footer>
+        <el-button @click="importDlg = false">取消</el-button>
+        <el-button type="primary" :disabled="!importNos.length" :loading="importing" @click="doImport">
+          加入错题本（{{ importNos.length }} 题）
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 import api from '../api'
 import MathText from '../components/MathText.vue'
@@ -110,6 +130,42 @@ const analyzing = ref(false)
 const editScores = ref(false)
 const trendEl = ref(null)
 let chart = null
+const importDlg = ref(false)
+const importNos = ref([])
+const importing = ref(false)
+
+const wrongQuestions = computed(() =>
+  (paper.value?.questions || []).filter((q) => (q.got_score || 0) < (q.score || 0))
+)
+
+function openImportDlg() {
+  importNos.value = wrongQuestions.value.map((q) => q.no)
+  importDlg.value = true
+}
+
+function toggle(no) {
+  const i = importNos.value.indexOf(no)
+  if (i >= 0) importNos.value.splice(i, 1)
+  else importNos.value.push(no)
+}
+
+function plainText(t) {
+  return String(t || '').replace(/\s+/g, ' ').slice(0, 56)
+}
+
+async function doImport() {
+  importing.value = true
+  try {
+    const r = await api.post(`/papers/${paper.value.id}/add-wrong-to-notebook`, { nos: importNos.value })
+    ElMessage.success(
+      `已加入 ${r.created_count} 道错题` +
+        (r.skipped_nos.length ? `，${r.skipped_nos.length} 道已在错题本中（跳过）` : '')
+    )
+    importDlg.value = false
+  } catch { /* 拦截器已提示 */ } finally {
+    importing.value = false
+  }
+}
 
 const scoreRate = computed(() =>
   paper.value && paper.value.total_score
@@ -185,4 +241,7 @@ onMounted(async () => {
 .spacer { flex: 1; }
 .kp-tag { margin: 0 4px 4px 0; }
 .lost { color: #f56c6c; font-weight: 600; }
+.wrong-item { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; cursor: pointer; }
+.wrong-item :deep(.el-checkbox__label) { white-space: normal; line-height: 1.6; }
+.wrong-text { color: #909399; font-size: 13px; line-height: 1.8; }
 </style>

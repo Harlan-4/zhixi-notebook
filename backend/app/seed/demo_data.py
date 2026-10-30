@@ -171,6 +171,7 @@ def build_demo_questions() -> list[dict]:
             "review_stage": 3,
             "last_result": "pass",
             "next_review_at": None,
+            "collected_at": today,
             "analysis": {
                 "correct_answer": "$\\dfrac{19}{9}$",
                 "solution_steps": [

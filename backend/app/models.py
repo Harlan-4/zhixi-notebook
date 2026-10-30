@@ -50,6 +50,7 @@ class Question(Base):
     review_stage: Mapped[int] = mapped_column(Integer, default=0)   # 通过几次复习间隔
     last_result: Mapped[str] = mapped_column(String(8), default="")  # pass/fail
     next_review_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    collected_at: Mapped[date | None] = mapped_column(Date, nullable=True)  # 收服时间：三次复习通过转掌握的那天
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)

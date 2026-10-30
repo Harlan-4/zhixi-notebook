@@ -78,6 +78,7 @@
 
 <script setup>
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import * as echarts from 'echarts'
 import api from '../api'
 import MathText from '../components/MathText.vue'
@@ -90,6 +91,10 @@ const subjects = ['数学', '物理', '化学', '生物']
 const grades = ['七年级', '八年级', '九年级', '高一', '高二', '高三']
 const subject = ref('数学')
 const grade = ref('')
+// 支持 URL 直达：/graph?subject=物理&grade=高一（分享与演示视频可深链）
+const route = useRoute()
+if (route.query.subject) subject.value = route.query.subject
+if (route.query.grade) grade.value = route.query.grade
 const nodeCount = ref(0)
 let chart = null
 let graphData = null

@@ -23,6 +23,11 @@ def ensure_schema() -> None:
     if "knowledge_points" not in inspector.get_table_names():
         return
     kcols = {c["name"] for c in inspector.get_columns("knowledge_points")}
+    qcols = (
+        {c["name"] for c in inspector.get_columns("questions")}
+        if "questions" in inspector.get_table_names()
+        else set()
+    )
     with engine.begin() as conn:
         if "subject" not in kcols:
             conn.execute(
@@ -51,6 +56,15 @@ def ensure_schema() -> None:
                 "OR name LIKE '%分解%' OR name LIKE '%求值%' OR name LIKE '%混合%' OR name LIKE '%面积%')"
             )
         )
+        # 游戏化：已掌握的题回填收服时间
+        if qcols and "collected_at" not in qcols:
+            conn.execute(text("ALTER TABLE questions ADD COLUMN collected_at DATE"))
+            conn.execute(
+                text(
+                    "UPDATE questions SET collected_at=CURRENT_DATE "
+                    "WHERE status='mastered' AND collected_at IS NULL"
+                )
+            )
 
 
 @asynccontextmanager
@@ -65,7 +79,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="智析错题本 API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="智析错题本 API", version="1.5.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

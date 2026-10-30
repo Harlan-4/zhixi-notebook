@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ...database import get_db
 from ...models import Paper
-from ...serializers import paper_to_dict
+from ...serializers import paper_to_dict, question_to_dict
 from ...services import ai_client, paper_service
 
 router = APIRouter(prefix="/api/papers", tags=["papers"])
@@ -79,16 +79,27 @@ def delete_paper(paper_id: int, db: Session = Depends(get_db)):
 
 @router.post("/recognize")
 async def recognize_paper(
-    file: UploadFile = File(...),
-    mime: str = Form(default="image/jpeg"),
+    files: list[UploadFile] = File(...),
+    kinds: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
-    """AI 识别整张试卷 -> 题目草稿（不入库）。"""
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "空文件")
+    """AI 识别整次考试：支持试卷+答题卡多图 -> 题目与得分草稿（不入库）。
+
+    kinds 为与 files 顺序对齐的逗号分隔类型（paper=试卷 / answer=答题卡），缺省按 paper 处理。
+    """
+    kind_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else []
+    paper_images: list[dict] = []
+    answer_images: list[dict] = []
+    for i, f in enumerate(files[:8]):  # 上限 8 张，控制单次识别成本
+        data = await f.read()
+        if not data:
+            raise HTTPException(400, "存在空文件")
+        img = {"data": data, "mime": f.content_type or "image/jpeg"}
+        (answer_images if (kind_list[i] if i < len(kind_list) else "paper") == "answer" else paper_images).append(img)
+    if not paper_images:
+        raise HTTPException(400, "请至少上传一张试卷照片")
     try:
-        draft = paper_service.recognize_paper(data, mime)
+        draft = paper_service.recognize_paper(paper_images, answer_images)
     except ai_client.AINotConfigured as e:
         raise HTTPException(503, str(e))
     except ai_client.AIServiceError as e:
@@ -102,3 +113,16 @@ def analyze_paper(paper_id: int, db: Session = Depends(get_db)):
     paper = _get_paper(db, paper_id)
     analysis = paper_service.analyze_paper(db, paper)
     return paper_to_dict(paper) | {"analysis": analysis}
+
+
+@router.post("/{paper_id}/add-wrong-to-notebook")
+def add_wrong_to_notebook(paper_id: int, payload: dict | None = None, db: Session = Depends(get_db)):
+    """把本卷失分题批量加入错题本（payload.nos 可指定题号，缺省为全部失分题）。"""
+    paper = _get_paper(db, paper_id)
+    nos = (payload or {}).get("nos")
+    created, skipped = paper_service.add_wrong_to_notebook(db, paper, nos)
+    return {
+        "created": [question_to_dict(q) for q in created],
+        "skipped_nos": skipped,
+        "created_count": len(created),
+    }

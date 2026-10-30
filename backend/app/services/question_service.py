@@ -1,7 +1,8 @@
-"""错题服务：AI 识题、错因解析、举一反三、复习打卡（艾宾浩斯间隔）。"""
-from datetime import date, timedelta
+"""错题服务：AI 识题、错因解析、举一反三、错因追问对话、复习打卡（艾宾浩斯间隔）。"""
+from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..models import Question
 from . import ai_client
@@ -17,7 +18,8 @@ RECOGNIZE_PROMPT = """你是初高中数学老师。请识别图片中的数学�
   "question_type": "选择题|填空题|解答题 之一",
   "options": ["A. ...", "B. ...", "C. ...", "D. ..."]（仅选择题有，其他为空数组）,
   "my_answer_visible": "图片中可见的学生作答/痕迹，没有则为空字符串"
-}"""
+}
+输出硬性要求：直接输出上述 JSON 对象本身，第一字符必须是"{"；禁止使用 markdown 代码块（```）、禁止任何解释、注释或多余文字。所有字段必须为双引号字符串或数组，字符串内不得出现未转义的英文双引号。"""
 
 ANALYZE_PROMPT = """你是经验丰富的初高中数学老师。学生做错了一道题，请给出完整解析，只输出一个JSON对象：
 {
@@ -127,18 +129,25 @@ def generate_variants(db: Session, q: Question) -> Question:
     return q
 
 
-def review_question(q: Question, result: str) -> Question:
-    """复习打卡：pass 沿 1/3/7 天间隔推进，三次通过转为已掌握；fail 回到 1 天后再练。"""
+def review_question(q: Question, result: str) -> bool:
+    """复习打卡：pass 沿 1/3/7 天间隔推进，三次通过转为已掌握（收服）；fail 回炉。
+
+    返回 just_collected：本次打卡是否触发"转为已掌握"的收服时刻。
+    """
     if result not in ("pass", "fail"):
         raise ValueError("result 必须是 pass 或 fail")
     q.review_count += 1
     q.last_result = result
     today = date.today()
+    just_collected = False
     if result == "pass":
         q.review_stage += 1
         if q.review_stage >= len(REVIEW_INTERVALS):
             q.status = "mastered"
             q.next_review_at = None
+            if q.collected_at is None:
+                q.collected_at = today
+            just_collected = True
         else:
             q.status = "reviewing"
             q.next_review_at = today + timedelta(days=REVIEW_INTERVALS[q.review_stage - 1])
@@ -146,7 +155,8 @@ def review_question(q: Question, result: str) -> Question:
         q.review_stage = 0
         q.status = "reviewing"
         q.next_review_at = today + timedelta(days=1)
-    return q
+        q.collected_at = None  # 已收服的题回炉则收回徽章
+    return just_collected
 
 
 REEXPLAIN_PROMPT = """你是一名初高中数学老师。学生对之前的讲解说"没听懂"，请换一个策略重新讲解这道题，只输出一个JSON对象：
@@ -192,6 +202,7 @@ def reexplain_question(db: Session, q: Question, style: str = "") -> Question:
     if len(alts) > 6:
         del alts[: len(alts) - 6]
     q.analysis = analysis
+    flag_modified(q, "analysis")  # 就地修改 JSON 后必须显式标记，否则不落库
     db.commit()
     db.refresh(q)
     return q
@@ -205,3 +216,139 @@ def check_answer(q: Question, answer: str) -> dict:
         f"【学生答案】{answer}"
     )
     return ai_client.chat_json([{"role": "user", "content": CHECK_ANSWER_PROMPT + "\n\n" + user}])
+
+
+DIAGNOSE_CHAT_PROMPT = """你是经验丰富的初高中数学老师，正在通过一对一追问确认学生做错这道题的真实错因。
+当前AI解析给出的是推测错因，你的任务是通过对话收集证据。只输出一个JSON对象：
+{
+  "reply": "回应学生的话（口语化、简短、以鼓励为主）；证据足够时改为简短的确认与点拨",
+  "concluded": true或false,
+  "error_type": "概念不清|计算失误|审题错误|方法未掌握|其他 之一（仅concluded为true时必填）",
+  "cause_summary": "一两句确认后的错因结论（仅concluded为true时必填）"
+}
+规则：
+- 每轮 reply 末尾最多追问 1 个问题，问完就等学生回答，不要连珠炮；
+- 学生回答暴露了具体错误环节（说得出错在哪一步、为什么错）即可 concluded，不要无休止追问；
+- 学生回答模糊时换个角度再问一次；三轮后仍模糊，就按现有信息 concluded，并在 cause_summary 注明依据有限；
+- cause_summary 要写清"具体错在哪一步、为什么"，不要只写大类名词。"""
+
+DIAGNOSE_CHAT_LIMIT = 30    # analysis.diagnose_chat 最多保留的条数
+DIAGNOSE_CHAT_CONTEXT = 10  # 每次请求带给 AI 的最近对话条数
+ERROR_TYPES = ("概念不清", "计算失误", "审题错误", "方法未掌握", "其他")
+
+
+
+QA_CHAT_PROMPT = """你是耐心的初高中学科老师。学生刚看完这道错题的 AI 解析，还有没看懂的地方，正在向你提问。
+回答要求：
+1. 只回答与本题目、本题解法或相关知识点有关的疑问；一次只讲清楚一个点，语气口语化、鼓励为主。
+2. 学生已看过解题步骤，回答时可直接引用步骤编号（如"第 2 步"），不要整题重讲。
+3. 公式和算式一律用 $...$ 的 LaTeX 书写；一次回答控制在 150 字以内，宁可留一个追问点让学生继续问。
+4. 学生的问题太笼统时，先给一句话直觉解释，再反问确认他卡在哪一步。
+5. 若问题与本题目完全无关，简短回应并把话题拉回这道题；若学生表示已看懂，给一句肯定并建议下一步（重做变式/复习相邻知识点）。
+6. 只输出回答正文，不要输出 JSON、前缀或任何多余解释。"""
+QA_CHAT_LIMIT = 30    # analysis.qa_chat 最多保留的条数
+QA_CHAT_CONTEXT = 10  # 每次请求带给 AI 的最近对话条数
+
+
+def qa_chat_question(db: Session, q: Question, message: str) -> dict:
+    """讲解答疑对话：学生就本题解析中没看懂的地方向 AI 提问，AI 用口语讲清。
+
+    对话历史存 q.analysis.qa_chat（无独立表）；先调 AI 后写库，失败不落半截状态。
+    """
+    analysis = q.analysis or {}
+    if not analysis:
+        raise ValueError("请先进行 AI 解析，再向 AI 提问")
+    message = (message or "").strip()
+    if not message:
+        raise ValueError("问题内容不能为空")
+
+    history = list(analysis.get("qa_chat") or [])
+    recent = history[-QA_CHAT_CONTEXT:]
+    convo = "\n".join(
+        f"{'学生' if h.get('role') == 'student' else '老师'}：{h.get('text', '')}" for h in recent
+    )
+    steps = "\n".join(str(x) for x in (analysis.get("solution_steps") or []))[:800]
+    user = (
+        f"【题目】{q.question_text}\n"
+        f"【学生作答】{q.my_answer.strip() or '（未提供）'}\n"
+        f"【正确答案】{(analysis.get('correct_answer') or '')[:200]}\n"
+        f"【解题步骤】\n{steps or '（无）'}\n"
+        f"【错因分析】{(analysis.get('error_analysis') or '')[:200]}\n"
+        f"【最近的对话】\n{convo or '（尚无对话）'}\n"
+        f"【学生本轮提问】{message}"
+    )
+    reply = ai_client.chat_text([{"role": "user", "content": QA_CHAT_PROMPT + "\n\n" + user}])
+    if not reply:
+        reply = "这个问题很关键！换个说法：你可以先告诉我，你是从第几步开始觉得不跟上的？"
+    ts = datetime.now().strftime("%m-%d %H:%M")
+    history += [
+        {"role": "student", "text": message, "ts": ts},
+        {"role": "ai", "text": reply, "ts": ts},
+    ]
+    if len(history) > QA_CHAT_LIMIT:
+        del history[: len(history) - QA_CHAT_LIMIT]
+    analysis["qa_chat"] = history
+    q.analysis = analysis
+    flag_modified(q, "analysis")  # 就地修改 JSON 后必须显式标记，否则不落库
+    db.commit()
+    db.refresh(q)
+    return {"reply": reply, "chat": analysis["qa_chat"]}
+
+
+def diagnose_chat_question(db: Session, q: Question, message: str) -> dict:
+    """错因追问对话：学生回答诊断追问，AI 收集证据，证据足够时回写确认错因。
+
+    对话历史存 q.analysis.diagnose_chat（无独立表）；先调 AI 后写库，失败不落半截状态。
+    """
+    analysis = q.analysis or {}
+    if not analysis:
+        raise ValueError("请先进行 AI 解析，再进行错因对话")
+    message = (message or "").strip()
+    if not message:
+        raise ValueError("回复内容不能为空")
+
+    history = list(analysis.get("diagnose_chat") or [])
+    recent = history[-DIAGNOSE_CHAT_CONTEXT:]
+    convo = "\n".join(
+        f"{'学生' if h.get('role') == 'student' else '老师'}：{h.get('text', '')}" for h in recent
+    )
+    user = (
+        f"【题目】{q.question_text}\n"
+        f"【学生作答】{q.my_answer.strip() or '（未提供）'}\n"
+        f"【当前推测错因】{(analysis.get('error_analysis') or '')[:300]}\n"
+        f"【待确认的诊断问题】{'；'.join(analysis.get('diagnose_questions') or []) or '无'}\n"
+        f"【当前错因分类】{q.error_type or '未知'}\n"
+        f"【最近的对话】\n{convo or '（尚无对话）'}\n"
+        f"【学生本轮回答】{message}"
+    )
+    data = ai_client.chat_json([{"role": "user", "content": DIAGNOSE_CHAT_PROMPT + "\n\n" + user}])
+
+    reply = str(data.get("reply") or "").strip() or "好的，能再具体说说当时是怎么想的吗？"
+    concluded = bool(data.get("concluded"))
+    ts = datetime.now().strftime("%m-%d %H:%M")
+    history += [
+        {"role": "student", "text": message, "ts": ts},
+        {"role": "ai", "text": reply, "ts": ts},
+    ]
+    if len(history) > DIAGNOSE_CHAT_LIMIT:
+        del history[: len(history) - DIAGNOSE_CHAT_LIMIT]
+
+    result = {"reply": reply, "concluded": concluded}
+    if concluded:
+        error_type = str(data.get("error_type") or "").strip()
+        if error_type in ERROR_TYPES:
+            q.error_type = error_type
+            result["error_type"] = error_type
+        cause_summary = str(data.get("cause_summary") or "").strip()
+        if cause_summary:
+            base = analysis.get("error_analysis") or ""
+            analysis["error_analysis"] = (base + ("\n\n" if base else "") + "【对话确认】" + cause_summary)[:800]
+            result["cause_summary"] = cause_summary
+        analysis["cause_evidence"] = "confirmed"
+    analysis["diagnose_chat"] = history
+    q.analysis = analysis
+    flag_modified(q, "analysis")  # 就地修改 JSON 后必须显式标记，否则不落库
+    db.commit()
+    db.refresh(q)
+    result["chat"] = analysis["diagnose_chat"]
+    return result

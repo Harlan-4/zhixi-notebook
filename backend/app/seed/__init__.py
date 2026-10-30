@@ -10,28 +10,42 @@ from ..services import paper_service
 from ..services.knowledge import heuristic_ktype
 from .demo_data import build_demo_papers, build_demo_questions, build_demo_workbook
 
-GRAPH_FILE = Path(__file__).parent / "knowledge_graph.json"
+GRAPH_FILES = [
+    Path(__file__).parent / "knowledge_graph.json",
+    Path(__file__).parent / "knowledge_graph_physics.json",
+    Path(__file__).parent / "knowledge_graph_chemistry.json",
+    Path(__file__).parent / "knowledge_graph_biology.json",
+]
 
 
 def seed_graph(db: Session) -> int:
-    """导入人教版初中数学知识点图谱（团队自主整理）。"""
-    if db.query(KnowledgePoint).count() > 0:
-        return 0
-    data = json.loads(GRAPH_FILE.read_text(encoding="utf-8"))
-    for p in data["points"]:
-        db.add(
-            KnowledgePoint(
-                subject=p.get("subject", data.get("subject", "数学")),
-                name=p["name"],
-                grade=p["grade"],
-                ktype=heuristic_ktype(p["name"]),
-                chapter=p["chapter"],
-                prereqs=p.get("prereqs", []),
-                description=p.get("description", ""),
+    """导入人教版数学/物理/化学/生物知识图谱（团队自主整理）。
+
+    按名称增量导入：已存在的知识点跳过（不修改既有行），只补入图谱文件新增的节点，
+    因此老版本数据库启动即自动升级，无需重置数据。
+    知识点名称要求全库唯一（跨科目也不得重名），图谱校验依赖这一约定。
+    """
+    added = 0
+    for gf in GRAPH_FILES:
+        data = json.loads(gf.read_text(encoding="utf-8"))
+        existing = {name for (name,) in db.query(KnowledgePoint.name).all()}
+        for p in data["points"]:
+            if p["name"] in existing:
+                continue
+            db.add(
+                KnowledgePoint(
+                    subject=p.get("subject", data.get("subject", "数学")),
+                    name=p["name"],
+                    grade=p["grade"],
+                    ktype=heuristic_ktype(p["name"]),
+                    chapter=p["chapter"],
+                    prereqs=p.get("prereqs", []),
+                    description=p.get("description", ""),
+                )
             )
-        )
-    db.commit()
-    return len(data["points"])
+            added += 1
+        db.commit()
+    return added
 
 
 def seed_demo(db: Session) -> None:
